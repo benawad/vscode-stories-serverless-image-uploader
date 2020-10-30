@@ -1,16 +1,45 @@
 import { AzureFunction, Context, HttpRequest } from "@azure/functions";
-import { BlobServiceClient } from "@azure/storage-blob";
+import { BlobServiceClient, BlockBlobClient } from "@azure/storage-blob";
 import Busboy from "busboy";
 import { v4 } from "uuid";
 import jwt from "jsonwebtoken";
-import { Readable } from "stream";
-import nsfwjs from 'nsfwjs';
-
+import nsfwjs from "nsfwjs";
 
 const blobServiceClient = BlobServiceClient.fromConnectionString(
   process.env.AZURE_STORAGE_CONNECTION_STRING!
 );
 const containerClient = blobServiceClient.getContainerClient("main");
+
+const doAsyncStuff = async (
+  blockBlobClient: BlockBlobClient,
+  file: NodeJS.ReadableStream
+) => {
+  const buf = await new Promise<Buffer>((res) => {
+    const bufs: any[] = [];
+    file.on("data", function (d) {
+      bufs.push(d);
+    });
+    file.on("end", () => {
+      res(Buffer.concat(bufs));
+    });
+  });
+  const nsfwProvider = await nsfwjs.load();
+  const predictions = await nsfwProvider.classifyGif(buf, {
+    topk: 1,
+    fps: 1,
+    onFrame: console.log,
+  });
+  predictions.forEach((value) => {
+    if (value[0].probability > 0.1) {
+      console.log("prob: ", value[0].probability);
+      throw new Error("nsfw detected");
+    }
+  });
+  console.log("start upload");
+  await blockBlobClient.upload(buf, buf.length, {
+    blobHTTPHeaders: { blobContentType: "image/gif" },
+  });
+};
 
 const httpTrigger: AzureFunction = async function (
   context: Context,
@@ -30,44 +59,22 @@ const httpTrigger: AzureFunction = async function (
 
   let p: Promise<any>;
 
-  let finallyPred = 0;
-  busboy.on("file", async(fieldname, file, filename, encoding, mimetype) => {
-    const buf = await new Promise<Buffer>((res) => {
-      const bufs: any[] = [];
-      file.on("data", function (d) {
-        bufs.push(d);
-      });
-      file.on("end", () => {
-        res(Buffer.concat(bufs));
-      });
-    });
-    const nsfwProvider = await nsfwjs.load();
-    const predictions = await nsfwProvider.classifyGif(buf, { 
-      topk: 1,
-      fps: 1,
-      onFrame: console.log
-    });
-    let prediction: number[] = [];
-    predictions.map((value) => {
-      prediction.push(value[0].probability);
-    });
-    prediction.map((value) => {
-      if(finallyPred < value) finallyPred = value;
-    });
-    console.log("start upload");
-    p = blockBlobClient.uploadStream(
-      new Readable().wrap(file),
-      undefined,
-      undefined,
-      {
-        blobHTTPHeaders: { blobContentType: "image/gif" },
-      }
-    );
+  busboy.on("file", (fieldname, file, filename, encoding, mimetype) => {
+    p = doAsyncStuff(blockBlobClient, file);
   });
   const done = new Promise((res) =>
     busboy.on("finish", async () => {
-      if (p && finallyPred <= 10) {
-        await p;
+      if (p) {
+        try {
+          await p;
+        } catch (err) {
+          console.log(err);
+          console.log("busboy did not find file :( / was nsfw");
+          res({
+            status: 400,
+            body: "nsfw content detected and blocked",
+          });
+        }
         console.log("busboy finish :)");
         res({
           status: 200,
