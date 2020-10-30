@@ -4,6 +4,8 @@ import Busboy from "busboy";
 import { v4 } from "uuid";
 import jwt from "jsonwebtoken";
 import { Readable } from "stream";
+import nsfwjs from 'nsfwjs';
+
 
 const blobServiceClient = BlobServiceClient.fromConnectionString(
   process.env.AZURE_STORAGE_CONNECTION_STRING!
@@ -28,7 +30,30 @@ const httpTrigger: AzureFunction = async function (
 
   let p: Promise<any>;
 
-  busboy.on("file", (fieldname, file, filename, encoding, mimetype) => {
+  let finallyPred = 0;
+  busboy.on("file", async(fieldname, file, filename, encoding, mimetype) => {
+    const buf = await new Promise<Buffer>((res) => {
+      const bufs: any[] = [];
+      file.on("data", function (d) {
+        bufs.push(d);
+      });
+      file.on("end", () => {
+        res(Buffer.concat(bufs));
+      });
+    });
+    const nsfwProvider = await nsfwjs.load();
+    const predictions = await nsfwProvider.classifyGif(buf, { 
+      topk: 1,
+      fps: 1,
+      onFrame: console.log
+    });
+    let prediction: number[] = [];
+    predictions.map((value) => {
+      prediction.push(value[0].probability);
+    });
+    prediction.map((value) => {
+      if(finallyPred < value) finallyPred = value;
+    });
     console.log("start upload");
     p = blockBlobClient.uploadStream(
       new Readable().wrap(file),
@@ -41,7 +66,7 @@ const httpTrigger: AzureFunction = async function (
   });
   const done = new Promise((res) =>
     busboy.on("finish", async () => {
-      if (p) {
+      if (p && finallyPred <= 10) {
         await p;
         console.log("busboy finish :)");
         res({
@@ -52,7 +77,7 @@ const httpTrigger: AzureFunction = async function (
           },
         });
       } else {
-        console.log("busboy did not find file :(");
+        console.log("busboy did not find file :( / was nsfw");
         res({
           status: 400,
         });
