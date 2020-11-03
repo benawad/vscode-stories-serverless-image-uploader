@@ -3,7 +3,15 @@ import { BlobServiceClient, BlockBlobClient } from "@azure/storage-blob";
 import Busboy from "busboy";
 import { v4 } from "uuid";
 import jwt from "jsonwebtoken";
-import nsfwjs from "nsfwjs";
+import { ApiKeyCredentials } from "@azure/ms-rest-js";
+import { ComputerVisionClient } from "@azure/cognitiveservices-computervision";
+
+const computerVisionClient = new ComputerVisionClient(
+  new ApiKeyCredentials({
+    inHeader: { "Ocp-Apim-Subscription-Key": process.env.AZURE_VISION_KEY },
+  }),
+  process.env.AZURE_VISION_ENDPOINT!
+);
 
 const blobServiceClient = BlobServiceClient.fromConnectionString(
   process.env.AZURE_STORAGE_CONNECTION_STRING!
@@ -23,22 +31,27 @@ const doAsyncStuff = async (
       res(Buffer.concat(bufs));
     });
   });
-  const nsfwProvider = await nsfwjs.load();
-  const predictions = await nsfwProvider.classifyGif(buf, {
-    topk: 1,
-    fps: 1,
-    onFrame: console.log,
+  const q = await computerVisionClient.analyzeImageInStream(buf, {
+    visualFeatures: ["Adult"],
   });
-  predictions.forEach((value) => {
-    if (value[0].probability > 0.1) {
-      console.log("prob: ", value[0].probability);
-      throw new Error("nsfw detected");
-    }
-  });
-  console.log("start upload");
+
   await blockBlobClient.upload(buf, buf.length, {
     blobHTTPHeaders: { blobContentType: "image/gif" },
   });
+
+  if (q.adult?.isAdultContent) {
+    return "adult";
+  }
+
+  if (q.adult?.isRacyContent) {
+    return "racy";
+  }
+
+  if (q.adult?.goreScore) {
+    return "gore";
+  }
+
+  return null;
 };
 
 const httpTrigger: AzureFunction = async function (
@@ -57,45 +70,42 @@ const httpTrigger: AzureFunction = async function (
   const filename = v4() + ".gif";
   const blockBlobClient = containerClient.getBlockBlobClient(filename);
 
-  let p: Promise<any>;
+  let p: Promise<any> | null = null;
 
   busboy.on("file", (fieldname, file, filename, encoding, mimetype) => {
     p = doAsyncStuff(blockBlobClient, file);
   });
+
   const done = new Promise((res) =>
-    busboy.on("finish", async () => {
-      if (p) {
-        try {
-          await p;
-        } catch (err) {
-          console.log(err);
-          console.log("busboy did not find file :( / was nsfw");
-          res({
-            status: 400,
-            body: "nsfw content detected and blocked",
-          });
-        }
-        console.log("busboy finish :)");
-        res({
-          status: 200,
-          body: { token: jwt.sign({ filename }, process.env.TOKEN_SECRET!) },
-          headers: {
-            "Content-Type": "application/json",
-          },
-        });
-      } else {
-        console.log("busboy did not find file :( / was nsfw");
-        res({
-          status: 400,
-        });
-      }
+    busboy.on("finish", () => {
+      res();
     })
   );
 
   busboy.write(req.body, function () {});
 
-  const value = await done;
-  return value;
+  await done;
+  if (p) {
+    const flagged = await p;
+    console.log("busboy finish :)");
+    return {
+      status: 200,
+      body: {
+        token: jwt.sign({ filename, flagged }, process.env.TOKEN_SECRET!, {
+          expiresIn: "1m",
+        }),
+      },
+      headers: {
+        "Content-Type": "application/json",
+      },
+    };
+  }
+
+  console.log("busboy did not find file");
+  return {
+    status: 400,
+    body: "invalid payload",
+  };
 };
 
 export default httpTrigger;

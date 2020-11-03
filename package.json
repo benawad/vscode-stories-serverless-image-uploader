@@ -10,10 +10,11 @@
     "test": "echo \"No tests yet...\""
   },
   "dependencies": {
+    "@azure/cognitiveservices-computervision": "^7.1.0",
+    "@azure/ms-rest-js": "^2.1.0",
     "@azure/storage-blob": "^12.2.1",
     "busboy": "^0.3.1",
     "jsonwebtoken": "^8.5.1",
-    "nsfwjs": "^2.3.0",
     "uuid": "^8.3.1"
   },
   "devDependencies": {
